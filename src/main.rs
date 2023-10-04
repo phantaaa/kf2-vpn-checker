@@ -1,83 +1,107 @@
-extern crate anyhow;
-extern crate futures;
-extern crate reqwest;
-extern crate structopt;
-extern crate tokio;
-
-use std::collections::HashSet;
-
-use anyhow::{Error, Result};
-use futures::future::join_all;
-use reqwest::Client;
-use structopt::StructOpt;
-
-use config::Opt;
-use html_parser::HtmlParser;
+use eyre::Result;
 use ip_checker::IpChecker;
-use models::Player;
+use reqwest::Client;
 
-mod config;
-mod html_parser;
+use tracing::{error, info};
+use webadmin::WebAdminClient;
+
 mod ip_checker;
-mod models;
+mod webadmin;
 
-const CHECKING_INTERVAL_IN_SECONDS: u64 = 5 * 60;
+fn app() -> clap::Command {
+  const PKG_NAME: &str = env!("CARGO_PKG_NAME");
+  const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+  clap::Command::new(PKG_NAME)
+    .version(PKG_VERSION)
+    .author(clap::crate_authors!("\n"))
+    .arg(
+      clap::Arg::new("address")
+        .required(true)
+        .short('a')
+        .long("address")
+        .num_args(1)
+        .value_name("url"),
+    )
+    .arg(
+      clap::Arg::new("username")
+        .required(true)
+        .short('l')
+        .long("login")
+        .num_args(1),
+    )
+    .arg(
+      clap::Arg::new("password")
+        .required(true)
+        .short('p')
+        .long("password")
+        .num_args(1),
+    )
+    .arg(
+      clap::Arg::new("api-key")
+        .required(true)
+        .short('k')
+        .long("api-key")
+        .num_args(1)
+        .value_name("key"),
+    )
+}
+
+const CHECKING_INTERVAL: tokio::time::Duration =
+  tokio::time::Duration::from_secs(5 * 60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Client::new();
-    let opt = Opt::from_args();
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
-        CHECKING_INTERVAL_IN_SECONDS,
-    ));
-    let mut checked_players_ip: HashSet<String> = HashSet::new();
+  tracing_subscriber::fmt::init();
 
-    loop {
-        interval.tick().await;
+  let client = Client::new();
+  let args = app().get_matches();
 
-        match HtmlParser::fetch_and_parse_html(&client, &opt).await {
-            Ok(players) => {
-                let players_to_check: Vec<_> = players
-                    .into_iter()
-                    .filter(|player| !checked_players_ip.contains(&player.ip))
-                    .collect();
+  macro_rules! param_required {
+    ($type:ty, $name:expr) => {
+      args
+        .get_one::<$type>($name)
+        .map(ToOwned::to_owned)
+        .unwrap()
+    };
+  }
 
-                let tasks: Vec<_> = players_to_check
-                    .into_iter()
-                    .map(|player| {
-                        checked_players_ip.insert(player.steam_id.clone());
-                        process_player(&client, player, &opt.api_key)
-                    })
-                    .collect();
+  let webadmin = WebAdminClient {
+    address: param_required!(String, "address"),
+    username: param_required!(String, "username"),
+    password: param_required!(String, "password"),
+    client: client.clone(),
+  };
+  let checker = IpChecker::new(client, param_required!(String, "api-key"));
+  let mut interval = tokio::time::interval(CHECKING_INTERVAL);
 
-                if tasks.len() > 0 {
-                    println!("--------------------------");
-                }
+  loop {
+    interval.tick().await;
 
-                join_all(tasks).await;
-            }
-            Err(e) => eprintln!(
-                "Error: {}, Failed to fetch and parse HTML or no players are playing",
-                e
-            ),
-        }
+    info!("checking for players");
+
+    let tasks = webadmin
+      .players()
+      .await?
+      .into_iter()
+      .map(|player| async {
+        let result = checker.get(&player.ip).await;
+        (player, result)
+      })
+      .collect::<Vec<_>>();
+
+    for task in tasks {
+      let (player, response) = task.await;
+      match response {
+        Ok(data) => {
+          if data.proxy || data.vpn {
+            info!(?player, ?data, "ඞ found sussy player ඞ");
+          }
+        },
+        Err(err) => {
+          error!(?player, ?err, "failed to check player");
+        },
+      }
     }
-    //Ok(())
-}
-
-async fn process_player(client: &Client, player: Player, api_key: &str) -> Result<Player, Error> {
-    match IpChecker::check_ip(client, &player, api_key).await {
-        Ok(response) => {
-            let output: String = format!("{:?} - {:?}", player, response);
-            if response.proxy {
-                println!("\x1b[31m{}\x1b[0m", output);
-            } else {
-                println!("{}", output);
-            }
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    }
-    Ok(player)
+  }
 }
